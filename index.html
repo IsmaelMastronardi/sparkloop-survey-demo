@@ -94,20 +94,48 @@
   </main>
 
   <script>
-    const surveyUuid = "survey_YOUR_SURVEY_UUID";
+    // --- SparkLoop config ------------------------------------------------------
+    // Client mode: SparkLoop never renders its own widget, this page owns the UI.
+    // Test mode stays on while building, so nothing is recorded as real traffic.
+    // Turn it off only once SparkLoop has reviewed and activated the integration.
+    const publicationUuid = "pub_6aa6c1374096";
+    const surveyUuid = "survey_a800a880e760";
+    const testMode = new URLSearchParams(location.search).get("test_mode") !== "false";
 
+    window.SL = { mode: "client", test_mode: testMode };
+
+    // The embed fires sl:ready on document once SL.client is usable. Listen right away so
+    // the event can't fire before we're listening, and give up if it never comes.
+    const sparkloopReady = new Promise((resolve, reject) => {
+      document.addEventListener("sl:ready", () => resolve(window.SL.client), { once: true });
+      setTimeout(() => reject(Object.assign(
+        new Error("The SparkLoop script didn't load. Check the publication ID and that this host is allowed."),
+        { code: "not_ready", details: [] },
+      )), 15000);
+    });
+
+    const embed = document.createElement("script");
+    embed.async = true;
+    embed.src = `https://js.sparkloop.app/embed.js?publication_id=${encodeURIComponent(publicationUuid)}`;
+    embed.setAttribute("data-sparkloop", "");
+    document.head.appendChild(embed);
+  </script>
+
+  <script>
     // --- Data source ----------------------------------------------------------
-    // Not connected to anything yet. fetchSurvey resolves with a survey object
+    // Backed by SL.client.surveys. fetchSurvey resolves with a survey object
     // ({ uuid, header, subheader, button_label, skip_link, custom_terms, items }), and
-    // submitSurvey resolves on success or rejects with an error carrying
+    // submitSurvey resolves on success or rejects with a ClientApiError carrying
     // { code, message, status, details }.
 
     async function fetchSurvey({ uuid }) {
-      throw Object.assign(new Error("No survey source connected yet."), { code: "not_connected" });
+      const client = await sparkloopReady;
+      return client.surveys.fetch({ uuid });
     }
 
-    async function submitSurvey(payload) {
-      throw Object.assign(new Error("No submit target connected yet."), { code: "not_connected", details: [] });
+    async function submitSurvey({ uuid, email, answers, promotionUuids }) {
+      const client = await sparkloopReady;
+      return client.surveys.submit({ uuid, email, answers, promotionUuids });
     }
     const app = document.getElementById("app");
     const logEl = document.getElementById("log");
@@ -274,7 +302,19 @@
       return value === condition.value;
     }
 
+    // Once a multi_select question reaches max_selections, its unpicked options are disabled.
+    function applySelectionLimits() {
+      survey.items
+        .filter((item) => item.input_type === "multi_select" && item.max_selections)
+        .forEach((question) => {
+          const inputs = [ ...app.querySelectorAll(`input[name="q_${question.uuid}"]`) ];
+          const full = inputs.filter((input) => input.checked).length >= question.max_selections;
+          inputs.forEach((input) => { input.disabled = full && !input.checked; });
+        });
+    }
+
     function applyConditions() {
+      applySelectionLimits();
       // Triggers always come before the items that depend on them, so one pass in order is enough.
       survey.items.forEach((item) => {
         const field = app.querySelector(`[data-uuid="${item.uuid}"]`);
@@ -303,9 +343,10 @@
       if (!field) return;
       const label = survey.items.find((item) => item.uuid === questionUuid)?.label || "This question";
       field.classList.add("has-error");
+      // A question can come back with several problems at once; list them all.
       const error = field.querySelector(".error");
+      error.textContent = error.hidden ? `${label} ${message}` : `${error.textContent}; ${message}`;
       error.hidden = false;
-      error.textContent = `${label} ${message}`;
     }
 
     async function onSubmit(event) {
@@ -378,6 +419,16 @@
         app.appendChild(el("p", { className: "subheader", text: promotionUuids.length
           ? `You claimed ${promotionUuids.length} promotion${promotionUuids.length === 1 ? "" : "s"}.`
           : "You didn't claim any promotions." }));
+
+        // Lead offers and recommendations are fully claimed by submit. Click and action offers
+        // only convert on the brand's page, so give the reader a link to finish there.
+        survey.items
+          .filter((item) => promotionUuids.includes(item.uuid) && item.kind === "offer" && item.offer.redirect_url)
+          .forEach(({ offer }) => {
+            app.appendChild(el("p", {}, [
+              el("a", { href: offer.redirect_url, target: "_blank", rel: "noopener", text: `${offer.call_to_action || offer.headline} →` }),
+            ]));
+          });
       } catch (error) {
         log("→ rejected", { name: error.name, code: error.code, status: error.status, message: error.message, details: error.details });
         if (error.code === "invalid_answers") {
